@@ -1,0 +1,18 @@
+#!/bin/zsh
+# launchd 가 매일 부른다. Jev 무료 조건을 다시 조사하고, 경고가 있으면 맥 알림 + ALERT 파일.
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+J="${0:A:h}/jev"
+STATE="$HOME/.local/state/jev-judge"
+mkdir -p "$STATE"
+OUT=$(/usr/bin/python3 "$J" pricecheck --force 2>/dev/null)
+ALERTS=$(printf '%s' "$OUT" | /usr/bin/python3 -c 'import sys,json
+try:
+  d=json.load(sys.stdin); a=d.get("alerts") or []
+  print(("⛔ 막힘 · " if d.get("blocked") else "")+" / ".join(a))
+except Exception as e: print("점검 실패: "+str(e))')
+if [ -n "$ALERTS" ]; then
+  printf '%s  %s\n' "$(date '+%F %T')" "$ALERTS" >> "$STATE/ALERT"
+  /usr/bin/osascript -e "display notification \"${ALERTS//\"/}\" with title \"jev-judge 비용 가드\"" >/dev/null 2>&1
+else
+  rm -f "$STATE/ALERT"
+fi

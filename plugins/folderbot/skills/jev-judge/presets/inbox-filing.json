@@ -1,0 +1,29 @@
+{
+  "_about": "jev-judge 인박스 분류 설정. 질문·기준값·전송 규칙·폴더 구조를 이 한 파일에 모은다. 바꿀 것은 여기만 바꾼다.",
+  "instructions": "볼트의 인박스에 들어온 항목이다. 이름·확장자·크기(폴더면 안에 든 파일 종류)만 보고, 이 항목이 옮겨 가야 할 폴더를 고른다. 날짜가 들어 있으면 그 날짜 무렵의 프로젝트를 우선 본다. 어느 폴더에도 뚜렷이 맞지 않으면 '모름'을 고른다.",
+  "folders": {
+    "inbox": "1. Inbox",
+    "candidates": [
+      ["2. Projects", "진행 중 프로젝트(마감이 있다)"],
+      ["3. Area", "상시 운영 영역"],
+      ["4. Resources", "관심사 자료"],
+      ["5. Archive", "끝나서 보관된 프로젝트"]
+    ]
+  },
+  "thresholds": { "suggest": 0.9, "pick2": 0.5 },
+  "cost_guard": {
+    "policy": "block",
+    "free_credit_usd": 5,
+    "_policy_values": "block = 비용이 붙으면 Jev 를 막고 LLM 이 판단 · warn = 경고만 하고 계속"
+  },
+  "mask": {},
+  "_mask_example": { "홍길동": "본인" },
+  "never_send": ["주민", "계좌", "통장", "신분증", "여권", "진단", "처방", "계약서", "급여", "원천징수", "비밀번호", "password", "보험증권", "passport", "contract", "salary"],
+  "inbox_ignore": ["CLAUDE.md", "AGENTS.md", "readme.md", "README.md", "01_Images"],
+  "inbox_system_scan": ["02_Recordings", "03_Downloads"],
+  "extra_options": {
+    "새 프로젝트 필요": "어느 기존 폴더에도 맞지 않고, 새 프로젝트 폴더를 만들어야 할 일이다",
+    "모름": "이름만으로는 판단할 단서가 부족하다"
+  },
+  "llm_choices": ["모름", "새 프로젝트 필요"]
+}

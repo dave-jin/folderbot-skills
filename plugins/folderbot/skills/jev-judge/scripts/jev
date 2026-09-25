@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""jev — Jev(TypeSafe) 를 Vercel AI Gateway 로 부르는 분류 CLI.
+
+총괄 LLM 이 부른다. 판단만 하고 파일은 절대 옮기지 않는다.
+비용 가드: Jev 가 무료가 아니게 되면 막거나 경고하고, 그때는 종료 코드 3 으로
+「LLM 이 직접 판단하라」를 돌려준다.
+
+  jev status                 가드 상태·잔액·마지막 점검
+  jev pricecheck [--force]   무료 여부를 다시 조사한다(24시간마다 자동)
+  jev inbox [--limit N]      볼트 인박스 항목마다 목적지를 고른다(JSON 줄)
+  jev choice --state TEXT --option 'key=설명' ...   일회성 판단
+
+키: macOS 키체인 서비스 `ai-gateway` / 계정 `jev-judge`. 환경변수·파일·인자에 두지 않는다.
+볼트: 환경변수 FOLDERBOT_VAULT(없으면 PARA_ROOT, 그것도 없으면 현재 폴더).
+"""
+import argparse, hashlib, json, os, re, subprocess, sys, time, urllib.request, urllib.error
+from pathlib import Path
+
+HOME = Path.home()
+SKILL_DIR = Path(__file__).resolve().parent.parent
+PRESET = Path(os.environ.get("JEV_PRESET", SKILL_DIR / "presets" / "inbox-filing.json"))
+STATE_DIR = Path(os.environ.get("JEV_STATE_DIR", HOME / ".local/state/jev-judge"))
+GUARD = STATE_DIR / "guard.json"
+LOG = STATE_DIR / "calls.jsonl"
+PARA = Path(os.environ.get("FOLDERBOT_VAULT") or os.environ.get("PARA_ROOT") or os.getcwd())
+GW = "https://ai-gateway.vercel.sh"
+MODEL = "typesafe-ai/jev"
+FREE_PAGE = "https://vercel.com/ai-gateway/models?freeTier=true"
+CHECK_EVERY = 24 * 3600
+EXIT_LLM = 3  # 호출하지 말고 LLM 이 직접 판단하라
+
+
+# ── 작은 도구 ───────────────────────────────────────────────────────────────
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def load_json(p, default):
+    try:
+        return json.loads(Path(p).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(p, obj):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(p) + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(p)
+
+
+def log(rec):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": now(), **rec}, ensure_ascii=False) + "\n")
+
+
+def key():
+    r = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "ai-gateway", "-a", "jev-judge", "-w"],
+                       capture_output=True, text=True)
+    k = r.stdout.strip()
+    return k or None
+
+
+def http(method, url, body=None, auth=True, timeout=30):
+    h = {"User-Agent": "jev-judge/1", "Accept": "application/json"}
+    if auth:
+        k = key()
+        if not k:
+            raise RuntimeError("키체인에 ai-gateway/jev-judge 키가 없다")
+        h["Authorization"] = "Bearer " + k
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "replace")
+    return raw
+
+
+def warn(msg):
+    print("⚠️ jev-judge: " + msg, file=sys.stderr)
+
+
+# ── 비용 가드 ────────────────────────────────────────────────────────────────
+def pricecheck(force=False, quiet=False):
+    g = load_json(GUARD, {})
+    if not force and g.get("checked_epoch", 0) > time.time() - CHECK_EVERY:
+        return g
+    found, notes = {}, []
+    # ① 모델 목록 API — 정가
+    try:
+        ms = json.loads(http("GET", GW + "/v1/models", auth=False)).get("data", [])
+        m = next((x for x in ms if x.get("id") == MODEL), None)
+        if m is None:
+            notes.append("모델 목록에 Jev 가 없다(내려갔을 수 있다)")
+            found["listed"] = False
+        else:
+            found["listed"] = True
+            found["price_input"] = (m.get("pricing") or {}).get("input")
+            found["zdr"] = m.get("zdr")
+    except Exception as e:
+        notes.append(f"모델 목록 조회 실패: {e}")
+    # ② 무료 등급 페이지 — isFree / availableToFreeTier
+    try:
+        t = http("GET", FREE_PAGE, auth=False).replace('\\"', '"')
+        i = t.find('"slug":"jev"')
+        if i < 0:
+            notes.append("무료 등급 페이지에서 Jev 를 못 찾았다")
+        else:
+            seg = t[i:i + 4000]
+            f1 = re.search(r'"availableToFreeTier":(true|false)', seg)
+            f2 = re.search(r'"isFree":(true|false)', seg)
+            found["free_tier"] = (f1.group(1) == "true") if f1 else None
+            found["is_free"] = (f2.group(1) == "true") if f2 else None
+    except Exception as e:
+        notes.append(f"무료 등급 페이지 조회 실패: {e}")
+    # ③ 팀 잔액 — 크레딧을 샀으면(잔액이 무료분보다 크면) 유료 등급이다
+    try:
+        c = json.loads(http("GET", GW + "/v1/credits"))
+        found["balance"] = float(c.get("balance", 0))
+        found["total_used"] = float(c.get("total_used", 0))
+    except Exception as e:
+        notes.append(f"잔액 조회 실패: {e}")
+    g.update(found)
+    g["checked_at"], g["checked_epoch"], g["check_notes"] = now(), time.time(), notes
+    g.setdefault("baseline_used", found.get("total_used"))
+    evaluate_guard(g)
+    save_json(GUARD, g)
+    if not quiet and g.get("alerts"):
+        for a in g["alerts"]:
+            warn(a)
+    return g
+
+
+def evaluate_guard(g):
+    preset = load_json(PRESET, {})
+    policy = (preset.get("cost_guard") or {}).get("policy", "block")
+    free_cap = float((preset.get("cost_guard") or {}).get("free_credit_usd", 5))
+    alerts, hard = [], []
+    if g.get("last_cost", 0) and float(g["last_cost"]) > 0:
+        hard.append(f"마지막 호출에 비용 ${g['last_cost']} 이 붙었다 — Jev 가 더는 무료가 아니다")
+    if g.get("is_free") is False:
+        hard.append("Vercel 이 Jev 를 무료(isFree)에서 뺐다")
+    if g.get("listed") is False:
+        hard.append("Vercel 모델 목록에서 Jev 가 사라졌다")
+    if g.get("balance") is not None and g["balance"] > free_cap + 0.001:
+        hard.append(f"잔액 ${g['balance']} 이 무료분 ${free_cap} 보다 크다 — 크레딧을 산 유료 등급일 수 있다")
+    bu, tu = g.get("baseline_used"), g.get("total_used")
+    if bu is not None and tu is not None and tu > bu + 1e-9:
+        alerts.append(f"팀 누적 사용액이 ${bu} → ${tu} 로 늘었다(다른 모델 사용일 수 있다)")
+    if g.get("free_tier") is False:
+        alerts.append("Vercel 이 Jev 를 무료 등급 대상에서 뺐다")
+    for n in g.get("check_notes", []):
+        alerts.append("점검 불완전: " + n)
+    g["alerts"] = hard + alerts
+    g["blocked"] = bool(hard) and policy == "block"
+    g["policy"] = policy
+    return g
+
+
+def guard_or_exit():
+    g = pricecheck()
+    if g.get("blocked"):
+        for a in g.get("alerts", []):
+            warn(a)
+        warn("비용 가드가 Jev 를 막았다 → LLM 이 직접 판단하라. 풀려면 사용자가 확인한 뒤 `jev unblock`")
+        print(json.dumps({"engine": "blocked", "reason": g.get("alerts")}, ensure_ascii=False))
+        sys.exit(EXIT_LLM)
+    return g
+
+
+def record_cost(cost):
+    g = load_json(GUARD, {})
+    g["last_cost"] = cost
+    if cost and cost > 0:
+        g["last_cost_at"] = now()
+    evaluate_guard(g)
+    save_json(GUARD, g)
+    if g.get("blocked"):
+        warn("이번 호출에 비용이 붙었다. 다음 호출부터 막는다: " + "; ".join(g["alerts"]))
+
+
+# ── Jev 호출 ────────────────────────────────────────────────────────────────
+def evaluate(state, criteria, instructions):
+    body = {
+        "model": MODEL,
+        "state": state,
+        "questions": {"dest": {"type": "choice", "instructions": instructions, "criteria": criteria}},
+        "providerOptions": {"gateway": {"only": ["typesafe-ai"]}},
+    }
+    t0 = time.time()
+    raw = None
+    for attempt in range(3):  # 429(용량 부족)·529 는 잠깐 쉬고 두 번까지 다시 — 다른 공급자로는 넘기지 않는다
+        try:
+            raw = http("POST", GW + "/v1/evaluate", body)
+            break
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            if e.code in (429, 529) and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return {"error": f"HTTP {e.code}", "detail": detail}
+        except Exception as e:
+            return {"error": str(e)}
+    ms = int((time.time() - t0) * 1000)
+    r = json.loads(raw)
+    a = (r.get("answers") or {}).get("dest") or {}
+    probs = a.get("probabilities") or {}
+    top = sorted(probs.items(), key=lambda kv: -kv[1])[:2]
+    gw = ((r.get("providerMetadata") or {}).get("gateway") or {})
+    cost = float(gw.get("cost") or 0)
+    record_cost(cost)
+    return {"choice": a.get("choice"), "confidence": a.get("confidence"), "top2": top,
+            "tokens": (r.get("usage") or {}).get("inputTokens"), "cost": cost,
+            "market_cost": gw.get("marketCost"), "ms": ms}
+
+
+def band(conf, preset, choice=None):
+    th = preset.get("thresholds", {})
+    if conf is None or choice in set(preset.get("llm_choices", [])):
+        return "llm"
+    if conf >= th.get("suggest", 0.9):
+        return "suggest"
+    if conf >= th.get("pick2", 0.5):
+        return "pick2"
+    return "llm"
+
+
+# ── PARA 인박스 ─────────────────────────────────────────────────────────────
+def parse_folder(role, name):
+    m = re.match(r"^(\d{4}(?:-\d{2})?(?:-\d{2})?)_(.+)$", name)
+    if m:
+        return f"{role} · 마감 {m.group(1)} · {m.group(2).replace('-', ' ')}"
+    m = re.match(r"^([^_]+)_(.+)$", name)
+    if m:
+        return f"{role} · {m.group(1)} · {m.group(2).replace('-', ' ')}"
+    return f"{role} · {name}"
+
+
+def candidates(preset):
+    roles = [tuple(r) for r in (preset.get("folders") or {}).get("candidates", [])] or [
+        ("2. Projects", "진행 중 프로젝트(마감이 있다)"), ("3. Area", "상시 운영 영역"),
+        ("4. Resources", "관심사 자료"), ("5. Archive", "끝나서 보관된 프로젝트")]
+    crit = {}
+    for top, role in roles:
+        d = PARA / top
+        if not d.is_dir():
+            continue
+        for c in sorted(d.iterdir()):
+            if c.is_dir() and not c.name.startswith((".", "_")):
+                crit[f"{top}/{c.name}"] = parse_folder(role, c.name)
+    for k, v in (preset.get("extra_options") or {}).items():
+        crit[k] = v
+    return crit
+
+
+def mask(s, preset):
+    for a, b in (preset.get("mask") or {}).items():
+        s = s.replace(a, b)
+    return s
+
+
+def sensitive(name, preset):
+    low = name.lower()
+    return next((w for w in preset.get("never_send", []) if w.lower() in low), None)
+
+
+def is_local(p):
+    try:
+        return os.stat(p).st_blocks > 0  # Dropbox·iCloud 온라인 전용(자리표시자)은 0
+    except OSError:
+        return False
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def size_index(targets):
+    """인박스 파일과 크기가 같은 볼트 파일만 모은다(stat 만 해서 내려받기를 일으키지 않는다)."""
+    want = {}
+    for p in targets:
+        try:
+            want.setdefault(os.path.getsize(p), []).append(p)
+        except OSError:
+            pass
+    hits = {}
+    preset = load_json(PRESET, {})
+    inbox = (preset.get("folders") or {}).get("inbox", "1. Inbox")
+    skip = {inbox, ".git", "node_modules", ".aiworkspace", ".folderbot"}
+    tops = [c[0] for c in (preset.get("folders") or {}).get("candidates", [])] or ["2. Projects", "3. Area", "4. Resources", "5. Archive"]
+    for top in tops:
+        for root, dirs, files in os.walk(PARA / top):
+            dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    continue
+                if sz in want and sz > 0:
+                    hits.setdefault(sz, []).append(fp)
+    return hits
+
+
+def dest_of(path):
+    return "/".join(Path(path).relative_to(PARA).parts[:2])
+
+
+def inbox_items(preset):
+    ib = PARA / (preset.get("folders") or {}).get("inbox", "1. Inbox")
+    if not ib.is_dir():
+        warn(f"인박스 폴더가 없다: {ib} — FOLDERBOT_VAULT 를 볼트 루트로 지정하라")
+        return []
+    keep = set(preset.get("inbox_ignore", []))
+    items = []
+    for c in sorted(ib.iterdir()):
+        if c.name.startswith(".") or c.name in keep:
+            continue
+        if re.match(r"^\d{2}_", c.name) and c.is_dir():
+            if c.name in preset.get("inbox_system_scan", []):
+                for g in sorted(c.iterdir()):
+                    if not g.name.startswith("."):
+                        items.append(g)
+            continue
+        items.append(c)
+    return items
+
+
+def describe(p, preset):
+    name = mask(p.name, preset)
+    st = {"name": name, "kind": "folder" if p.is_dir() else "file"}
+    if p.is_dir():
+        kids = [k for k in p.iterdir() if not k.name.startswith(".")]
+        exts = {}
+        for k in kids:
+            e = k.suffix.lower() or ("(folder)" if k.is_dir() else "(none)")
+            exts[e] = exts.get(e, 0) + 1
+        st["children"] = len(kids)
+        st["child_types"] = dict(sorted(exts.items(), key=lambda kv: -kv[1])[:5])
+    else:
+        st["ext"] = p.suffix.lower().lstrip(".")
+        try:
+            st["size_kb"] = round(p.stat().st_size / 1024)
+        except OSError:
+            pass
+    if p.parent.name != (preset.get("folders") or {}).get("inbox", "1. Inbox"):
+        st["inbox_subfolder"] = p.parent.name
+    return st
+
+
+def cmd_inbox(a):
+    preset = load_json(PRESET, {})
+    items = inbox_items(preset)
+    if a.limit:
+        items = items[: a.limit]
+    files = [str(p) for p in items if p.is_file()]
+    hits = size_index(files)
+    crit = candidates(preset)
+    blocked_msg = None
+    for p in items:
+        out = {"item": str(p.relative_to(PARA)), "kind": "folder" if p.is_dir() else "file"}
+        # ① 로컬 중복 — 전송 없음
+        if p.is_file() and is_local(p):
+            try:
+                sz = p.stat().st_size
+                same = [q for q in hits.get(sz, []) if is_local(q)]
+                if same:
+                    h = sha(p)
+                    dup = next((q for q in same if sha(q) == h), None)
+                    if dup:
+                        out.update(engine="dup", band="dup", choice=dest_of(dup),
+                                   note="볼트에 같은 파일이 이미 있다(sha256 일치): " + str(Path(dup).relative_to(PARA)))
+                        log({"cmd": "inbox", **out})
+                        print(json.dumps(out, ensure_ascii=False))
+                        continue
+            except OSError:
+                pass
+        if p.is_file():
+            try:
+                sz = p.stat().st_size
+                twin = next((q for q in hits.get(sz, []) if Path(q).name == p.name and not is_local(q)), None)
+            except OSError:
+                twin = None
+            if twin:
+                out.update(engine="dup", band="dup?", choice=dest_of(twin),
+                           note="이름·크기가 같은 사본이 있다(온라인 전용이라 해시는 안 봤다): " + str(Path(twin).relative_to(PARA)))
+                log({"cmd": "inbox", **out})
+                print(json.dumps(out, ensure_ascii=False))
+                continue
+        # ② 민감 항목 — 보내지 않는다
+        w = sensitive(p.name, preset)
+        if w:
+            out.update(engine="llm", band="llm", note=f"민감어 「{w}」 → 보내지 않음. LLM 이 직접 판단")
+            log({"cmd": "inbox", **out})
+            print(json.dumps(out, ensure_ascii=False))
+            continue
+        # ③ Jev
+        if blocked_msg is None:
+            g = pricecheck()
+            if g.get("blocked"):
+                blocked_msg = "; ".join(g.get("alerts", []))
+                warn("비용 가드가 Jev 를 막았다: " + blocked_msg)
+        if blocked_msg:
+            out.update(engine="blocked", band="llm", note="비용 가드: " + blocked_msg)
+            print(json.dumps(out, ensure_ascii=False))
+            continue
+        st = describe(p, preset)
+        r = evaluate(st, crit, preset.get("instructions"))
+        if "error" in r:
+            out.update(engine="error", band="llm", note=r["error"] + " " + r.get("detail", ""))
+        else:
+            out.update(engine="jev", sent=st, band=band(r["confidence"], preset, r["choice"]), **r)
+            if load_json(GUARD, {}).get("blocked"):
+                blocked_msg = "호출 중 비용 발생"
+        log({"cmd": "inbox", **{k: v for k, v in out.items() if k != "sent"}})
+        print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_choice(a):
+    preset = load_json(PRESET, {})
+    guard_or_exit()
+    crit = {}
+    for o in a.option:
+        k, _, v = o.partition("=")
+        crit[k.strip()] = v.strip() or k.strip()
+    state = mask(a.state, preset)
+    r = evaluate(state, crit, a.instructions or "가장 알맞은 선택지를 고른다")
+    if "error" in r:
+        print(json.dumps({"engine": "error", **r}, ensure_ascii=False))
+        sys.exit(EXIT_LLM)
+    out = {"engine": "jev", "band": band(r["confidence"], preset, r["choice"]), **r}
+    log({"cmd": "choice", **out})
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_status(a):
+    g = pricecheck(force=a.force, quiet=True)
+    print(json.dumps({k: g.get(k) for k in ["checked_at", "policy", "blocked", "is_free", "free_tier", "listed",
+                                              "price_input", "balance", "total_used", "baseline_used",
+                                              "last_cost", "alerts"]}, ensure_ascii=False, indent=1))
+
+
+def cmd_unblock(a):
+    g = load_json(GUARD, {})
+    g["last_cost"] = 0
+    g["baseline_used"] = g.get("total_used")
+    g["checked_epoch"] = 0
+    save_json(GUARD, g)
+    pricecheck(force=True)
+    cmd_status(argparse.Namespace(force=False))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="jev")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    s = sp.add_parser("status"); s.add_argument("--force", action="store_true"); s.set_defaults(f=cmd_status)
+    s = sp.add_parser("pricecheck"); s.add_argument("--force", action="store_true")
+    s.set_defaults(f=lambda a: (pricecheck(force=a.force), cmd_status(argparse.Namespace(force=False))))
+    s = sp.add_parser("unblock"); s.set_defaults(f=cmd_unblock)
+    s = sp.add_parser("inbox"); s.add_argument("--limit", type=int); s.set_defaults(f=cmd_inbox)
+    s = sp.add_parser("choice"); s.add_argument("--state", required=True)
+    s.add_argument("--option", action="append", required=True); s.add_argument("--instructions")
+    s.set_defaults(f=cmd_choice)
+    a = ap.parse_args()
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+{
+  "name": "folderbot-skills",
+  "description": "Folder Bot 과 함께 쓰는 볼트 정리 스킬 모음 — Jev 분류, PARA 인박스 정리, 볼트 팀 에이전트",
+  "owner": { "name": "dave-jin", "url": "https://github.com/dave-jin" },
+  "plugins": [
+    {
+      "name": "folderbot",
+      "source": "./plugins/folderbot",
+      "description": "jev-judge(빠른 분류) · start · project-charter 스킬, 볼트 명령 5개, 볼트 팀 에이전트 4명",
+      "version": "0.1.0"
+    }
+  ]
+}
