@@ -1,6 +1,6 @@
 {
   "name": "folderbot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "폴더를 세계로 가꾸는 사람을 위한 볼트 도구 — Jev 로 먼저 고르고 애매하면 LLM 이 판단하는 분류, PARA 인박스 정리·아카이브·주간 리뷰 명령, 파일을 나눠 소유하는 볼트 팀 에이전트 4명",
   "author": { "name": "dave-jin", "url": "https://github.com/dave-jin" },
   "homepage": "https://github.com/dave-jin/folderbot-skills",

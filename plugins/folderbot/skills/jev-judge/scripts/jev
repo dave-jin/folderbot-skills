@@ -13,7 +13,7 @@
 키: macOS 키체인 서비스 `ai-gateway` / 계정 `jev-judge`. 환경변수·파일·인자에 두지 않는다.
 볼트: 환경변수 FOLDERBOT_VAULT(없으면 PARA_ROOT, 그것도 없으면 현재 폴더).
 """
-import argparse, hashlib, json, os, re, subprocess, sys, time, urllib.request, urllib.error
+import argparse, hashlib, json, os, re, subprocess, sys, time, unicodedata, urllib.request, urllib.error
 from pathlib import Path
 
 HOME = Path.home()
@@ -31,6 +31,19 @@ EXIT_LLM = 3  # 호출하지 말고 LLM 이 직접 판단하라
 
 
 # ── 작은 도구 ───────────────────────────────────────────────────────────────
+def nfc(s):
+    """macOS 는 한글 파일 이름을 NFD(자모 분해)로 준다. 프리셋은 NFC 라 비교 전에 맞춘다(2026-10-03)."""
+    return unicodedata.normalize("NFC", s) if isinstance(s, str) else s
+
+
+def nfc_all(o):
+    if isinstance(o, dict):
+        return {nfc(k): nfc_all(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [nfc_all(v) for v in o]
+    return nfc(o)
+
+
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -183,7 +196,29 @@ def record_cost(cost):
 
 
 # ── Jev 호출 ────────────────────────────────────────────────────────────────
-def evaluate(state, criteria, instructions):
+class Refused(Exception):
+    pass
+
+
+def outbound_check(state, criteria, preset):
+    """바깥으로 나가기 직전 마지막 관문. 이름 가림이 빠졌거나 민감어가 남았으면 보내지 않는다."""
+    blob = json.dumps(state, ensure_ascii=False) if not isinstance(state, str) else state
+    w = sensitive(blob, preset)
+    if w:
+        raise Refused(f"민감어 「{w}」")
+    allblob = blob + json.dumps(criteria, ensure_ascii=False)
+    left = next((a for a in (preset.get("mask") or {}) if nfc(a) in allblob), None)
+    if left:
+        raise Refused(f"가려야 할 이름 「{left}」이 남았다")
+
+
+def evaluate(state, criteria, instructions, preset=None):
+    state, criteria, instructions = nfc_all(state), nfc_all(criteria), nfc(instructions)
+    if preset is not None:
+        try:
+            outbound_check(state, criteria, preset)
+        except Refused as e:
+            return {"error": "refused", "detail": str(e) + " → 보내지 않음. LLM 이 직접 판단"}
     body = {
         "model": MODEL,
         "state": state,
@@ -250,21 +285,23 @@ def candidates(preset):
             continue
         for c in sorted(d.iterdir()):
             if c.is_dir() and not c.name.startswith((".", "_")):
-                crit[f"{top}/{c.name}"] = parse_folder(role, c.name)
+                n = nfc(c.name)
+                crit[f"{top}/{n}"] = mask(parse_folder(role, n), preset)
     for k, v in (preset.get("extra_options") or {}).items():
         crit[k] = v
     return crit
 
 
 def mask(s, preset):
+    s = nfc(s)
     for a, b in (preset.get("mask") or {}).items():
-        s = s.replace(a, b)
+        s = s.replace(nfc(a), nfc(b))
     return s
 
 
 def sensitive(name, preset):
-    low = name.lower()
-    return next((w for w in preset.get("never_send", []) if w.lower() in low), None)
+    low = nfc(name).casefold()
+    return next((w for w in preset.get("never_send", []) if nfc(w).casefold() in low), None)
 
 
 def is_local(p):
@@ -351,7 +388,7 @@ def describe(p, preset):
         except OSError:
             pass
     if p.parent.name != (preset.get("folders") or {}).get("inbox", "1. Inbox"):
-        st["inbox_subfolder"] = p.parent.name
+        st["inbox_subfolder"] = mask(p.parent.name, preset)
     return st
 
 
@@ -395,7 +432,7 @@ def cmd_inbox(a):
                 print(json.dumps(out, ensure_ascii=False))
                 continue
         # ② 민감 항목 — 보내지 않는다
-        w = sensitive(p.name, preset)
+        w = sensitive(str(p.relative_to(PARA / (preset.get("folders") or {}).get("inbox", "1. Inbox"))), preset)
         if w:
             out.update(engine="llm", band="llm", note=f"민감어 「{w}」 → 보내지 않음. LLM 이 직접 판단")
             log({"cmd": "inbox", **out})
@@ -412,14 +449,15 @@ def cmd_inbox(a):
             print(json.dumps(out, ensure_ascii=False))
             continue
         st = describe(p, preset)
-        r = evaluate(st, crit, preset.get("instructions"))
+        r = evaluate(st, crit, preset.get("instructions"), preset)
         if "error" in r:
-            out.update(engine="error", band="llm", note=r["error"] + " " + r.get("detail", ""))
+            out.update(engine="llm" if r["error"] == "refused" else "error", band="llm",
+                       note=r["error"] + " " + r.get("detail", ""))
         else:
             out.update(engine="jev", sent=st, band=band(r["confidence"], preset, r["choice"]), **r)
             if load_json(GUARD, {}).get("blocked"):
                 blocked_msg = "호출 중 비용 발생"
-        log({"cmd": "inbox", **{k: v for k, v in out.items() if k != "sent"}})
+        log({"cmd": "inbox", **out})  # sent 도 남긴다 — 무엇이 나갔는지 나중에 대조할 수 있게
         print(json.dumps(out, ensure_ascii=False))
 
 
@@ -428,15 +466,17 @@ def cmd_choice(a):
     guard_or_exit()
     crit = {}
     for o in a.option:
-        k, _, v = o.partition("=")
-        crit[k.strip()] = v.strip() or k.strip()
+        k, _, v = nfc(o).partition("=")
+        crit[k.strip()] = mask(v.strip() or k.strip(), preset)
     state = mask(a.state, preset)
-    r = evaluate(state, crit, a.instructions or "가장 알맞은 선택지를 고른다")
+    r = evaluate(state, crit, a.instructions or "가장 알맞은 선택지를 고른다", preset)
     if "error" in r:
-        print(json.dumps({"engine": "error", **r}, ensure_ascii=False))
+        out = {"engine": "llm" if r["error"] == "refused" else "error", **r}
+        log({"cmd": "choice", "sent": state, **out})
+        print(json.dumps(out, ensure_ascii=False))
         sys.exit(EXIT_LLM)
     out = {"engine": "jev", "band": band(r["confidence"], preset, r["choice"]), **r}
-    log({"cmd": "choice", **out})
+    log({"cmd": "choice", "sent": state, **out})
     print(json.dumps(out, ensure_ascii=False))
 
 

@@ -7,7 +7,7 @@
       "name": "folderbot",
       "source": "./plugins/folderbot",
       "description": "jev-judge(빠른 분류) · start · project-charter 스킬, 볼트 명령 5개, 볼트 팀 에이전트 4명",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }
